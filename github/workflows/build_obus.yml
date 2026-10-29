@@ -1,0 +1,273 @@
+name: build-@fyxod_cpp-offline
+# Полностью автономная сборка: ничего не клонируется и не скачивается.
+# Весь исходник лежит в src/ (cheat.cpp, build.sh, include/*). Правишь src/cheat.cpp -> Actions -> Run workflow.
+# Чужой код (ImGui, файлы enenH) вендорен в src/include/ и сверяется с src/THIRD_PARTY.sha256 перед каждой сборкой.
+# Прав на запись в репозиторий у воркфлоу нет.
+#
+# Secrets required:
+#   ENC_KEY  — 64 hex chars (32 bytes). Generate: python3 -c "import os; print(os.urandom(32).hex())"
+#              Add in: Settings -> Secrets and variables -> Actions -> New repository secret
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'release: strip all log/print strings (NOLOG)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup NDK (not present on the stock ubuntu-24.04 runner — build.sh defaults NDK_HOME to /opt/android-ndk)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1 # not SHA-pinned like the other two actions below — I didn't verify a commit hash for this one, pin it yourself if that matters to you
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: guard (vendored third-party files unchanged, build.sh has no network calls)
+        run: |
+          set -euo pipefail
+          test -f src/build.sh -a -f src/cheat.cpp -a -f src/make_launcher.sh
+          cd src
+          sha256sum -c --quiet THIRD_PARTY.sha256
+          for f in build.sh make_launcher.sh; do
+            if grep -v 'nonet-ok' "$f" | grep -nE '(^|[^[:alnum:]_])(git +clone|curl|wget|pip +install|npm +install|apt(-get)? +install)([^[:alnum:]_]|$)'; then
+              echo "$f contains a network/download command"; exit 1
+            fi
+          done
+          echo "guard ok"
+
+      - name: write chacha20.hpp
+        run: |
+          mkdir -p src/include
+          cat > src/include/chacha20.hpp << 'CHACHA_EOF'
+          // chacha20.hpp — self-contained ChaCha20 (RFC 8439), no dependencies
+          #pragma once
+          #include <cstdint>
+          #include <cstring>
+          namespace cc20 {
+          static inline uint32_t rotl32(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+          static inline uint32_t load32_le(const uint8_t* p) {
+              return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+          }
+          static inline void store32_le(uint8_t* p, uint32_t v) {
+              p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
+          }
+          #define QR(a,b,c,d) \
+              a+=b;d^=a;d=rotl32(d,16); c+=d;b^=c;b=rotl32(b,12); \
+              a+=b;d^=a;d=rotl32(d, 8); c+=d;b^=c;b=rotl32(b, 7);
+          static void chacha20_block(uint8_t out[64], const uint32_t state[16]) {
+              uint32_t x[16];
+              for(int i=0;i<16;++i) x[i]=state[i];
+              for(int i=0;i<10;++i){
+                  QR(x[0],x[4],x[ 8],x[12]) QR(x[1],x[5],x[ 9],x[13])
+                  QR(x[2],x[6],x[10],x[14]) QR(x[3],x[7],x[11],x[15])
+                  QR(x[0],x[5],x[10],x[15]) QR(x[1],x[6],x[11],x[12])
+                  QR(x[2],x[7],x[ 8],x[13]) QR(x[3],x[4],x[ 9],x[14])
+              }
+              for(int i=0;i<16;++i) store32_le(out+i*4, x[i]+state[i]);
+          }
+          #undef QR
+          static void chacha20_xor(uint8_t* buf, size_t len,
+                                   const uint8_t key[32], const uint8_t nonce[12],
+                                   uint32_t counter=0) {
+              uint32_t state[16]={
+                  0x61707865u,0x3320646eu,0x79622d32u,0x6b206574u,
+                  load32_le(key+ 0),load32_le(key+ 4),load32_le(key+ 8),load32_le(key+12),
+                  load32_le(key+16),load32_le(key+20),load32_le(key+24),load32_le(key+28),
+                  counter,
+                  load32_le(nonce+0),load32_le(nonce+4),load32_le(nonce+8),
+              };
+              uint8_t block[64];
+              while(len>0){
+                  chacha20_block(block,state);
+                  size_t n=len<64?len:64;
+                  for(size_t i=0;i<n;++i) buf[i]^=block[i];
+                  buf+=n; len-=n; state[12]++;
+              }
+              memset(block,0,sizeof(block));
+          }
+          } // namespace cc20
+          CHACHA_EOF
+          echo "chacha20.hpp written"
+
+      - name: encrypt strings -> enc_strings.hpp
+        env:
+          ENC_KEY: ${{ secrets.ENC_KEY }}
+          SIG_KEY: ${{ secrets.SIG_KEY }}
+        run: |
+          python3 - << 'PY_EOF'
+          import os, struct, sys, secrets
+
+          key_hex = os.environ.get("ENC_KEY", "")
+          if len(key_hex) != 64:
+              print("ERROR: secret ENC_KEY must be 64 hex chars (32 bytes)", file=sys.stderr)
+              sys.exit(1)
+          KEY = bytes.fromhex(key_hex)
+
+          sig_key_hex = os.environ.get("SIG_KEY", "")
+          if len(sig_key_hex) != 64:
+              print("ERROR: secret SIG_KEY must be 64 hex chars (32 bytes)", file=sys.stderr)
+              sys.exit(1)
+
+          # ── рандомные имена — новые при каждой сборке ─────────────────────
+          # имя файла payload: случайный hex без lib-префикса и .so-суффикса
+          _lib_name = secrets.token_hex(8)          # например: a3f9c12e44b70d91
+          _lib_dst  = f"/data/data/com.catsbit.oxidesurvivalisland/cache/{_lib_name}"
+          # logcat-тег и бренд: случайный hex, не содержит "fyxod"/"cheat"
+          _tag      = secrets.token_hex(5)          # например: 3c8a1f2b04
+          # shm и key: рандомные имена файлов, не содержат "oxe"/"fyxod"/"cheat"
+          _shm_name = secrets.token_hex(6)          # например: 7d2a4f1c9e3b
+          _key_name = secrets.token_hex(6)          # например: 2b8f3a1d0c5e
+
+          # ── СТРОКИ ДЛЯ ШИФРОВАНИЯ ─────────────────────────────────────────
+          STRINGS = {
+              "STR_SIG_KEY":    sig_key_hex,   # HMAC key, matches Worker-side secret, never on wire
+              # off:: namespace — game identifiers
+              "STR_PKG":        "com.catsbit.oxidesurvivalisland",
+              "STR_IL2CPP_NS":  "Oxide",
+              "STR_IL2CPP_CLS": "PlayerManager",
+              "STR_F_EVENTS":   "playerEventHandler",
+              "STR_F_HEALTH":   "Health",
+              "STR_F_TEAM":     "teamName",
+              "STR_M_HP_A":     "Kek",
+              "STR_M_HP_B":     "KeA",
+              # paths
+              "STR_CFG_PATH":   "/data/local/tmp/.oxide_cfg.json",
+              "STR_LIB_DST":    _lib_dst,   # рандомный путь, без "lib"/"cheat" в имени
+              "STR_SHM_PATH":   f"/data/data/com.catsbit.oxidesurvivalisland/cache/.{_shm_name}",
+              "STR_KEY_PATH":   f"/data/local/tmp/.{_key_name}",
+              # runtime libs
+              "STR_LIBIL2CPP":  "libil2cpp.so",
+              "STR_LIBSSL_0":   "libssl.so",
+              "STR_LIBSSL_1":   "/apex/com.android.conscrypt/lib64/libssl.so",
+              "STR_LIBSSL_2":   "/system/lib64/libssl.so",
+              # license server
+              "STR_SRV_HOST":   "license-validator.gosthtoster.workers.dev",
+              # FILL: a SECOND hostname routed to the same Worker, on a domain/zone that isn't
+              # *.workers.dev — RU-style DPI blocks match on the TLS SNI, so swapping only the IP
+              # for the same name changes nothing; this needs a different name (e.g. a custom
+              # domain route added to the same Worker in the Cloudflare dashboard). Client tries
+              # this only if STR_SRV_HOST fails/times out. Empty string = fallback disabled.
+              "STR_SRV_HOST_ALT": "",
+              # UI / branding
+              "STR_BRAND_0":    _tag,        # рандомный тег вместо "fyxod_cpp"
+              "STR_BRAND_1":    _tag,        # рандомный тег вместо "@fyxod_cpp"
+              "STR_OVERLAY":    "overlay",
+              # logcat tag
+              "STR_LOG_TAG":    _tag,        # рандомный тег — не виден в logcat как "fyxod"
+              # payload basename — совпадает с именем файла (без пути)
+              # используется в /proc/maps check: strstr(line, get_STR_LIBCHEAT())
+              "STR_LIBCHEAT":   _lib_name,   # рандомный, совпадает с _lib_dst basename
+
+          }
+          # ──────────────────────────────────────────────────────────────────
+
+          def rotl32(v, n): return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
+          def load32(b, i): return struct.unpack_from('<I', b, i)[0]
+          def store32(v):   return struct.pack('<I', v & 0xFFFFFFFF)
+
+          def chacha20_block(state):
+              x = list(state)
+              def qr(a,b,c,d):
+                  x[a]=(x[a]+x[b])&0xFFFFFFFF; x[d]^=x[a]; x[d]=rotl32(x[d],16)
+                  x[c]=(x[c]+x[d])&0xFFFFFFFF; x[b]^=x[c]; x[b]=rotl32(x[b],12)
+                  x[a]=(x[a]+x[b])&0xFFFFFFFF; x[d]^=x[a]; x[d]=rotl32(x[d], 8)
+                  x[c]=(x[c]+x[d])&0xFFFFFFFF; x[b]^=x[c]; x[b]=rotl32(x[b], 7)
+              for _ in range(10):
+                  qr(0,4, 8,12); qr(1,5, 9,13); qr(2,6,10,14); qr(3,7,11,15)
+                  qr(0,5,10,15); qr(1,6,11,12); qr(2,7, 8,13); qr(3,4, 9,14)
+              out = b''
+              for i in range(16): out += store32((x[i]+state[i])&0xFFFFFFFF)
+              return out
+
+          def cc20_xor(data, key, nonce, counter=0):
+              state = [
+                  0x61707865,0x3320646e,0x79622d32,0x6b206574,
+                  load32(key, 0),load32(key, 4),load32(key, 8),load32(key,12),
+                  load32(key,16),load32(key,20),load32(key,24),load32(key,28),
+                  counter,
+                  load32(nonce,0),load32(nonce,4),load32(nonce,8),
+              ]
+              out, pos = [], 0
+              while pos < len(data):
+                  block = chacha20_block(state)
+                  chunk = data[pos:pos+64]
+                  out.append(bytes(a^b for a,b in zip(chunk, block)))
+                  pos += 64
+                  state[12] = (state[12]+1) & 0xFFFFFFFF
+              return b''.join(out)[:len(data)]
+
+          def fmt(b): return ','.join(f'0x{v:02x}' for v in b)
+
+          lines = [
+              "// enc_strings.hpp — AUTO-GENERATED by CI, do not edit",
+              "#pragma once",
+              '#include "chacha20.hpp"',
+              "",
+              f"inline constexpr uint8_t ENC_KEY[32] = {{ {fmt(KEY)} }};",
+              "",
+          ]
+          for name, text in STRINGS.items():
+              nonce = os.urandom(12)
+              data  = text.encode() + b'\x00'
+              enc   = cc20_xor(data, KEY, nonce)
+              lines += [
+                  f"// {name} = \"{text}\"",
+                  f"inline constexpr uint8_t NONCE_{name}[12] = {{ {fmt(nonce)} }};",
+                  f"inline constexpr uint8_t ENC_{name}[{len(enc)}] = {{ {fmt(enc)} }};",
+                  f"inline const char* get_{name}() {{",
+                  f"    static uint8_t buf[{len(enc)}];",
+                  f"    __builtin_memcpy(buf, ENC_{name}, {len(enc)});",
+                  f"    cc20::chacha20_xor(buf, {len(enc)}, ENC_KEY, NONCE_{name}, 0);",
+                  f"    return reinterpret_cast<const char*>(buf);",
+                  f"}}",
+                  "",
+              ]
+
+          with open("src/include/enc_strings.hpp", "w") as f:
+              f.write('\n'.join(lines))
+          print(f"enc_strings.hpp written ({len(STRINGS)} strings)")
+          PY_EOF
+          # fail here, with a readable message, instead of a cryptic compiler error in the build step
+          test -s src/include/enc_strings.hpp && grep -q 'get_STR_PKG' src/include/enc_strings.hpp \
+            || { echo "enc_strings.hpp missing or empty after generation"; exit 1; }
+          test -s src/include/chacha20.hpp || { echo "chacha20.hpp missing"; exit 1; }
+          echo "enc_strings.hpp ok"
+          ls -l src/include/enc_strings.hpp src/include/chacha20.hpp
+
+      - name: build (arm64)
+        env:
+          RELEASE: ${{ inputs.release }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          bash src/build.sh
+
+      - name: protect (strip only, raw binary — never the launcher script)
+        run: |
+          set -euo pipefail
+          f="src/out/@fyxod_cpp"
+          [ -f "$f" ] || { echo "ERROR: $f not found"; exit 1; }
+          llvm-strip --strip-all "$f" 2>/dev/null \
+            || strip --strip-all "$f" 2>/dev/null \
+            || true
+          # upx removed: its stub doesn't reliably survive bionic's loader + W^X on ARM64 Android —
+          # observed as an instant, zero-output SIGSEGV before any user code runs. strip alone is
+          # kept; it only drops symbols/debug info, it doesn't touch load segments or entry behavior.
+          echo "protect ok"
+          # @fyxod_cpp_run.sh was written by build.sh BEFORE this step touched the binary above —
+          # its embedded payload is now stale. Regenerate it from the post-strip/post-upx bytes so
+          # the two uploaded files actually match. (The old version of this step looped over every
+          # file in src/out/* including the launcher itself, running strip/upx on a plain text
+          # shell script — that's what was corrupting @fyxod_cpp_run.sh into garbage.)
+          bash src/make_launcher.sh src/out/@fyxod_cpp src/out/@fyxod_cpp_run.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: "build-out"
+          path: src/out/*
