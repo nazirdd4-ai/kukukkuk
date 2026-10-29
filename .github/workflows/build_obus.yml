@@ -96,6 +96,14 @@ jobs:
           CHACHA_EOF
           echo "chacha20.hpp written"
 
+      - name: debug secret length
+        env:
+          ENC_KEY: ${{ secrets.ENC_KEY }}
+          SIG_KEY: ${{ secrets.SIG_KEY }}
+        run: |
+          echo "ENC_KEY length: ${#ENC_KEY}"
+          echo "SIG_KEY length: ${#SIG_KEY}"
+
       - name: encrypt strings -> enc_strings.hpp
         env:
           ENC_KEY: ${{ secrets.ENC_KEY }}
