@@ -22,7 +22,7 @@
 #include "anti/antivm.h"     // runtime emulator/farm-device tripwires (goldfish/genymotion/nox/...), see file header for the honest limit
 #include "anti/integrity.h"  // local self-hash tripwire, patched post-link by tools/patch_integrity.py — see file header for the honest limit
 #include "anti/sectcrypt.hpp" // PCODE-tagged functions ship encrypted at rest on a SECT_PROTECT build — see file header
-#include "hmac.hpp"          // HMAC-SHA256 for license response signing, see licenseCheck()
+#include "ed25519_verify.h"  // Ed25519 verify for license response signing, see licenseCheck()
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  OFFSETS / CONFIG — единый блок, меняй здесь
@@ -2019,10 +2019,12 @@ static bool httpsRequest(const char* host, const char* path, const char* reqBody
     void* ctx = a.SSL_CTX_new(a.TLS_client_method());
     if (!ctx) { EPRINT("license: SSL_CTX_new failed\n"); close(fd); return false; }
     // VERIFY_NONE: a MITM can still answer with an HTTP 200 and arbitrary bytes, but can no
-    // longer flip a rejection into an accept — licenseCheck() now requires a valid HMAC sig
-    // over the response (verifyLicenseSig()), which needs STR_SIG_KEY, not just network
-    // position. Full CA verification would additionally stop traffic *inspection* (the key
-    // value itself leaking to a MITM) — still worth doing, lower priority than the sig was.
+    // longer flip a rejection into an accept — licenseCheck() now requires a valid Ed25519 sig
+    // over the response (verifyLicenseSig()), forgeable only with SIG_PRIVKEY, which never
+    // exists client-side or on the wire at all (unlike the old HMAC scheme's STR_SIG_KEY, which
+    // was a client-side secret and so was theoretically extractable from a binary; a public key
+    // isn't). Full CA verification would still additionally stop traffic *inspection* — lower
+    // priority than the sig was, since nothing confidential travels in this response anymore.
     if (a.SSL_CTX_set_verify) a.SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);
     void* ssl = a.SSL_new(ctx);
     if (!ssl) { EPRINT("license: SSL_new failed\n"); if (a.SSL_CTX_free) a.SSL_CTX_free(ctx); close(fd); return false; }
@@ -2088,31 +2090,33 @@ static const char* jsonFindHexField(const char* body, const char* field, size_t*
     return p;
 }
 
-// Server must sign exactly "<licenseKey>|<0 or 1>" with HMAC-SHA256 under the same secret as
-// STR_SIG_KEY (worker-side env var, 64 hex chars / 32 bytes — generate with
-// `python3 -c "import os;print(os.urandom(32).hex())"`, same convention as ENC_KEY) and return
-// it as "sig":"<64 lowercase hex chars>" alongside "valid". See cloudflare_worker_sig_snippet.js
-// for the worker-side half of this.
+// Server signs exactly "<licenseKey>|<0 or 1>" with Ed25519 under the Worker's private key
+// (never built into any client) and returns it as "sig":"<128 lowercase hex chars>" (64-byte
+// signature) alongside "valid". Client verifies against ED25519_PUB — a PUBLIC key, not a
+// secret, so no client-side extraction (this build or any build) yields a working forge; see
+// ed25519_verify.h for why this replaced the prior HMAC/STR_SIG_KEY scheme. See
+// cloudflare_worker_sig_snippet.js for the worker-side half of this.
 static bool verifyLicenseSig(const char* key, bool valid, const char* body) {
     size_t sigLen = 0;
     const char* sigHex = jsonFindHexField(body, "sig", &sigLen);
-    if (!sigHex || sigLen != 64) { EPRINT("license: missing/malformed sig field\n"); return false; }
-    uint8_t sig[32];
+    if (!sigHex || sigLen != 128) { EPRINT("license: missing/malformed sig field\n"); return false; }
+    uint8_t sig[64];
     if (!hexDecode(sigHex, sigLen, sig, sizeof(sig))) { EPRINT("license: sig not valid hex\n"); return false; }
 
     char msg[160];
     int n = snprintf(msg, sizeof(msg), "%s|%c", key, valid ? '1' : '0');
     if (n <= 0 || n >= (int)sizeof(msg)) return false;
 
-    size_t sigKeyHexLen = strlen(get_STR_SIG_KEY());
-    uint8_t sigKey[32];
-    if (!hexDecode(get_STR_SIG_KEY(), sigKeyHexLen, sigKey, sizeof(sigKey))) {
-        EPRINT("license: bad STR_SIG_KEY (build misconfigured)\n"); return false;
+    size_t pubHexLen = strlen(get_STR_ED25519_PUB());
+    uint8_t pub[32];
+    if (!hexDecode(get_STR_ED25519_PUB(), pubHexLen, pub, sizeof(pub))) {
+        EPRINT("license: bad ED25519_PUB (build misconfigured)\n"); return false;
     }
 
-    uint8_t expected[32];
-    hmac::sha256(sigKey, sizeof(sigKey), (const uint8_t*)msg, (size_t)n, expected);
-    return hmac::constTimeEq(sig, expected, 32);
+    // ed25519_verify() is constant-time w.r.t. the signature/public key by construction (no
+    // secret-dependent branches on the verifier's own inputs — there is no secret here to leak
+    // timing about), so no separate constant-time compare is needed the way HMAC's was.
+    return ed25519_verify(sig, (const unsigned char*)msg, (unsigned long long)n, pub) == 1;
 }
 
 static LicResult licenseCheck(const char* key) {
@@ -2145,7 +2149,8 @@ static LicResult licenseCheck(const char* key) {
     // claimedValid alone used to be the whole check — that's anyone who can put bytes in front
     // of SSL_read() (MITM under VERIFY_NONE below, or a Frida hook on SSL_read itself, which
     // VERIFY_NONE->VERIFY_PEER would not even stop since it runs after TLS decrypts). The sig
-    // check below means a forged pass needs STR_SIG_KEY, not just control of the response bytes.
+    // check below means a forged pass needs SIG_PRIVKEY (Worker-only, never client-side), not
+    // just control of the response bytes.
     bool valid = claimedValid && verifyLicenseSig(key, true, body);
     if (!valid) EPRINT("license: rejected (%.80s)\n", body);
     return valid ? LIC_VALID : LIC_REJECTED;
