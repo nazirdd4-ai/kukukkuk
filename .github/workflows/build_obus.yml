@@ -5,8 +5,21 @@ name: build-@fyxod_cpp-offline
 # Прав на запись в репозиторий у воркфлоу нет.
 #
 # Secrets required:
-#   ENC_KEY  — 64 hex chars (32 bytes). Generate: python3 -c "import os; print(os.urandom(32).hex())"
-#              Add in: Settings -> Secrets and variables -> Actions -> New repository secret
+#   ENC_KEY       — 64 hex chars (32 bytes). Generate: python3 -c "import os; print(os.urandom(32).hex())"
+#                   Add in: Settings -> Secrets and variables -> Actions -> New repository secret
+#   ED25519_PUB   — 64 hex chars (32 bytes), the PUBLIC half of the Ed25519 keypair whose PRIVATE
+#                   half lives only as a Cloudflare Worker secret (never here, never in any client
+#                   build). Not confidential — baked into the binary same as any other string only
+#                   so `strings libcheat.so` doesn't hand a reverser a labelled "here is the pubkey"
+#                   constant for free. Generate the keypair ONCE, offline, e.g.:
+#                     python3 -c "
+#                     import nacl.signing   # PyNaCl; or any Ed25519 lib offline
+#                     sk = nacl.signing.SigningKey.generate()
+#                     print('PRIVATE (Worker secret SIG_PRIVKEY, wrangler secret put):', sk.encode().hex())
+#                     print('PUBLIC  (this repo secret ED25519_PUB):', sk.verify_key.encode().hex())"
+#                   Losing the private key breaks license issuance for all future builds (old
+#                   binaries keep working against old signed responses, but the Worker can no
+#                   longer produce new ones) — back it up like any other long-term signing key.
 on:
   workflow_dispatch:
     inputs:
@@ -99,15 +112,15 @@ jobs:
       - name: debug secret length
         env:
           ENC_KEY: ${{ secrets.ENC_KEY }}
-          SIG_KEY: ${{ secrets.SIG_KEY }}
+          ED25519_PUB: ${{ secrets.ED25519_PUB }}
         run: |
           echo "ENC_KEY length: ${#ENC_KEY}"
-          echo "SIG_KEY length: ${#SIG_KEY}"
+          echo "ED25519_PUB length: ${#ED25519_PUB}"
 
       - name: encrypt strings -> enc_strings.hpp
         env:
           ENC_KEY: ${{ secrets.ENC_KEY }}
-          SIG_KEY: ${{ secrets.SIG_KEY }}
+          ED25519_PUB: ${{ secrets.ED25519_PUB }}
         run: |
           python3 - << 'PY_EOF'
           import os, struct, sys, secrets
@@ -118,10 +131,12 @@ jobs:
               sys.exit(1)
           KEY = bytes.fromhex(key_hex)
 
-          sig_key_hex = os.environ.get("SIG_KEY", "")
-          if len(sig_key_hex) != 64:
-              print("ERROR: secret SIG_KEY must be 64 hex chars (32 bytes)", file=sys.stderr)
+          ed_pub_hex = os.environ.get("ED25519_PUB", "")
+          if len(ed_pub_hex) != 64:
+              print("ERROR: secret ED25519_PUB must be 64 hex chars (32 bytes)", file=sys.stderr)
               sys.exit(1)
+          # not confidential (see workflow header) — still routed through the same
+          # enc_strings.hpp pipeline as everything else, for consistency, not secrecy.
 
           # ── рандомные имена — новые при каждой сборке ─────────────────────
           # имя файла payload: случайный hex без lib-префикса и .so-суффикса
@@ -135,7 +150,7 @@ jobs:
 
           # ── СТРОКИ ДЛЯ ШИФРОВАНИЯ ─────────────────────────────────────────
           STRINGS = {
-              "STR_SIG_KEY":    sig_key_hex,   # HMAC key, matches Worker-side secret, never on wire
+              "STR_ED25519_PUB": ed_pub_hex,   # public verify key — leaking it changes nothing
               # off:: namespace — game identifiers
               "STR_PKG":        "com.catsbit.oxidesurvivalisland",
               "STR_IL2CPP_NS":  "Oxide",
