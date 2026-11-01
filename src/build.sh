@@ -48,7 +48,7 @@ INCLUDES="-I$I -I$I/native_surface -I$NDK_HOME/sources/android/native_app_glue"
 # this needs sectkey.h to exist BEFORE compiling, hence generating it here,
 # before CXXFLAGS/PAYLOAD_CXXFLAGS get built below).
 SECT_DEFINES=""
-if [ "${SECT_PROTECT:-0}" = "1" ]; then
+if [ "${SECT_PROTECT:-1}" = "1" ]; then
     echo "[*] SECT_PROTECT=1: generating sectkey.h..."
     SECTKEY_OUT="$(python3 "$SRC/../tools/gen_sectkey.py" "$OUT/sectkey.h")"
     SECT_KEY_HEX="$(echo "$SECTKEY_OUT" | sed -n 's/.*SECT_KEY_HEX=\([0-9a-f]*\).*/\1/p')"
@@ -100,7 +100,7 @@ echo "[*] compiling PAYLOAD (arm64)..."
     -shared -Wl,--gc-sections -Wl,-soname,"$PAYLOAD_OUT" \
     -o "$OUT/$PAYLOAD_OUT"
 
-if [ "${SECT_PROTECT:-0}" = "1" ]; then
+if [ "${SECT_PROTECT:-1}" = "1" ]; then
     echo "[*] encrypting payload pcode section..."
     python3 "$SRC/../tools/encrypt_section.py" "$OUT/$PAYLOAD_OUT" "$SECT_KEY_HEX" "$SECT_NONCE_HEX"
 fi
@@ -177,7 +177,7 @@ echo "[*] compiling HOST (arm64)..."
     -pie -Wl,--gc-sections \
     -o "$OUT/@fyxod_cpp"
 
-if [ "${SECT_PROTECT:-0}" = "1" ]; then
+if [ "${SECT_PROTECT:-1}" = "1" ]; then
     echo "[*] encrypting host pcode section..."
     python3 "$SRC/../tools/encrypt_section.py" "$OUT/@fyxod_cpp" "$SECT_KEY_HEX" "$SECT_NONCE_HEX"
 fi
@@ -197,7 +197,7 @@ echo "[+] done: $OUT/@fyxod_cpp ($(wc -c < "$OUT/@fyxod_cpp") bytes)"
 # header for why (UNVERIFIED on real hardware, known Android/UPX rough edges).
 # Must run, and re-patch the hash, before make_launcher.sh — same strip ->
 # shdr-drop -> integrity-patch ordering this script already uses above.
-if [ "${PROTECT:-0}" = "1" ]; then
+if [ "${PROTECT:-1}" = "1" ]; then
     bash "$SRC/../tools/protect.sh" "$OUT/@fyxod_cpp" "$ENC_KEY_HEX"
 fi
 
