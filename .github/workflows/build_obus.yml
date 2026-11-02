@@ -283,12 +283,10 @@ jobs:
           # observed as an instant, zero-output SIGSEGV before any user code runs. strip alone is
           # kept; it only drops symbols/debug info, it doesn't touch load segments or entry behavior.
           echo "protect ok"
-          # @fyxod_cpp_run.sh was written by build.sh BEFORE this step touched the binary above —
-          # its embedded payload is now stale. Regenerate it from the post-strip/post-upx bytes so
-          # the two uploaded files actually match. (The old version of this step looped over every
-          # file in src/out/* including the launcher itself, running strip/upx on a plain text
-          # shell script — that's what was corrupting @fyxod_cpp_run.sh into garbage.)
-          bash src/make_launcher.sh src/out/@fyxod_cpp src/out/@fyxod_cpp_run.sh
+          # No run.sh dropper is generated here anymore — build.sh ships the bare ELF
+          # (src/out/@fyxod_cpp) by default now. Set LAUNCHER=1 in the "build (arm64)" step's
+          # env above, then uncomment the line below, to get the self-extracting dropper back:
+          # bash src/make_launcher.sh src/out/@fyxod_cpp src/out/@fyxod_cpp_run.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -39,7 +39,17 @@ OPTFLAGS="-O2 -fvisibility=hidden -fPIE"
 
 WFLAGS="-Wall -Wextra -Wno-unused-parameter"
 
-INCLUDES="-I$I -I$I/native_surface -I$NDK_HOME/sources/android/native_app_glue"
+INCLUDES="-I$I -I$I/ed25519 -I$I/native_surface -I$NDK_HOME/sources/android/native_app_glue"
+
+# ed25519 verify-path object files — shared between HOST and PAYLOAD link lines below.
+# sign-side files (sign.c keypair.c seed.c add_scalar.c key_exchange.c) intentionally excluded.
+ED25519_SOURCES=(
+    "$I/ed25519/fe.c"
+    "$I/ed25519/ge.c"
+    "$I/ed25519/sc.c"
+    "$I/ed25519/sha512.c"
+    "$I/ed25519/verify.c"
+)
 
 # ── optional PCODE section encryption ────────────────────────────────────────
 # SECT_PROTECT=1 bash build.sh to enable. Off by default — see
@@ -48,7 +58,7 @@ INCLUDES="-I$I -I$I/native_surface -I$NDK_HOME/sources/android/native_app_glue"
 # this needs sectkey.h to exist BEFORE compiling, hence generating it here,
 # before CXXFLAGS/PAYLOAD_CXXFLAGS get built below).
 SECT_DEFINES=""
-if [ "${SECT_PROTECT:-1}" = "1" ]; then
+if [ "${SECT_PROTECT:-0}" = "1" ]; then
     echo "[*] SECT_PROTECT=1: generating sectkey.h..."
     SECTKEY_OUT="$(python3 "$SRC/../tools/gen_sectkey.py" "$OUT/sectkey.h")"
     SECT_KEY_HEX="$(echo "$SECTKEY_OUT" | sed -n 's/.*SECT_KEY_HEX=\([0-9a-f]*\).*/\1/p')"
@@ -75,6 +85,7 @@ CXXFLAGS="$OPTFLAGS $WFLAGS $INCLUDES $DEFINES $SECT_DEFINES -std=c++20 -fPIE"
 SOURCES=(
     "$SRC/cheat.cpp"
     "$I/Android_touch/TouchHelperA.cpp"
+    "${ED25519_SOURCES[@]}"
 )
 
 # no -lpthread: on Android the pthread API lives in libc, the NDK sysroot ships no libpthread (ld.lld: unable to find library)
@@ -96,11 +107,11 @@ PAYLOAD_OUT="${PAYLOAD_OUT:-libcheat.so}"
 echo "[*] payload file name: $PAYLOAD_OUT"
 
 echo "[*] compiling PAYLOAD (arm64)..."
-"$CXX" $PAYLOAD_CXXFLAGS "$SRC/cheat.cpp" $LIBS \
+"$CXX" $PAYLOAD_CXXFLAGS "$SRC/cheat.cpp" "${ED25519_SOURCES[@]}" $LIBS \
     -shared -Wl,--gc-sections -Wl,-soname,"$PAYLOAD_OUT" \
     -o "$OUT/$PAYLOAD_OUT"
 
-if [ "${SECT_PROTECT:-1}" = "1" ]; then
+if [ "${SECT_PROTECT:-0}" = "1" ]; then
     echo "[*] encrypting payload pcode section..."
     python3 "$SRC/../tools/encrypt_section.py" "$OUT/$PAYLOAD_OUT" "$SECT_KEY_HEX" "$SECT_NONCE_HEX"
 fi
@@ -177,7 +188,7 @@ echo "[*] compiling HOST (arm64)..."
     -pie -Wl,--gc-sections \
     -o "$OUT/@fyxod_cpp"
 
-if [ "${SECT_PROTECT:-1}" = "1" ]; then
+if [ "${SECT_PROTECT:-0}" = "1" ]; then
     echo "[*] encrypting host pcode section..."
     python3 "$SRC/../tools/encrypt_section.py" "$OUT/@fyxod_cpp" "$SECT_KEY_HEX" "$SECT_NONCE_HEX"
 fi
@@ -186,6 +197,17 @@ echo "[*] stripping..."
 "$TOOLCHAIN/bin/llvm-strip" --strip-all "$OUT/@fyxod_cpp"
 echo "[*] dropping host section headers..."
 python3 "$SRC/../tools/strip_shdrs.py" "$OUT/@fyxod_cpp"
+
+# padding: trailing bytes past the last PT_LOAD segment, ignored by the ELF loader (it only
+# reads program headers, never a section table — already dropped above). Pure size inflation,
+# nothing here is parsed or executed. Must run BEFORE patch_integrity.py: that step hashes the
+# whole file, so padding added after it would invalidate the self-check on every launch.
+# JUNK_MB=0 bash build.sh to disable.
+JUNK_MB="${JUNK_MB:-6}"
+if [ "$JUNK_MB" != "0" ]; then
+    echo "[*] padding (+${JUNK_MB}MB junk)..."
+    head -c "$((JUNK_MB * 1024 * 1024))" /dev/urandom >> "$OUT/@fyxod_cpp"
+fi
 
 echo "[*] patching host integrity hash..."
 python3 "$SRC/../tools/patch_integrity.py" "$OUT/@fyxod_cpp" "$ENC_KEY_HEX"
@@ -197,10 +219,16 @@ echo "[+] done: $OUT/@fyxod_cpp ($(wc -c < "$OUT/@fyxod_cpp") bytes)"
 # header for why (UNVERIFIED on real hardware, known Android/UPX rough edges).
 # Must run, and re-patch the hash, before make_launcher.sh — same strip ->
 # shdr-drop -> integrity-patch ordering this script already uses above.
-if [ "${PROTECT:-1}" = "1" ]; then
+if [ "${PROTECT:-0}" = "1" ]; then
     bash "$SRC/../tools/protect.sh" "$OUT/@fyxod_cpp" "$ENC_KEY_HEX"
 fi
 
 # launcher generation lives in make_launcher.sh — also called by the CI "protect" step
 # after strip/upx, so the embedded payload always matches the binary that actually ships.
-bash "$SRC/make_launcher.sh" "$OUT/@fyxod_cpp" "$OUT/@fyxod_cpp_run.sh"
+# Off by default: ship outputs the bare ELF ($OUT/@fyxod_cpp) now, not the self-extracting
+# run.sh dropper. LAUNCHER=1 bash build.sh brings the dropper back if you need it again.
+if [ "${LAUNCHER:-0}" = "1" ]; then
+    bash "$SRC/make_launcher.sh" "$OUT/@fyxod_cpp" "$OUT/@fyxod_cpp_run.sh"
+else
+    echo "[*] launcher skipped (LAUNCHER=1 to re-enable) — push/run the bare ELF: $OUT/@fyxod_cpp"
+fi
