@@ -177,7 +177,7 @@ jobs:
               # for the same name changes nothing; this needs a different name (e.g. a custom
               # domain route added to the same Worker in the Cloudflare dashboard). Client tries
               # this only if STR_SRV_HOST fails/times out. Empty string = fallback disabled.
-              "STR_SRV_HOST_ALT": "",
+              "STR_SRV_HOST_ALT": "license-fallback.pages.dev",
               # UI / branding
               "STR_BRAND_0":    _tag,        # рандомный тег вместо "fyxod_cpp"
               "STR_BRAND_1":    _tag,        # рандомный тег вместо "@fyxod_cpp"
